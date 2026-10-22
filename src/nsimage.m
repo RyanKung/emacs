@@ -259,8 +259,15 @@ ns_set_alpha (void *img, int x, int y, unsigned char a)
 void *
 ns_image_reset (void *img, int width, int height)
 {
-  [(EmacsImage *)img release];
-  return ns_image_for_XPM (width, height, 32);
+  EmacsImage *old = img;
+  EmacsImage *image = ns_image_for_XPM (width, height, 32);
+
+  /* Keep the transform and smoothing set by image_set_transform, or
+     the new image is drawn at its original size.  */
+  image->transform = [old->transform retain];
+  image->smoothing = old->smoothing;
+  [old release];
+  return image;
 }
 
 size_t
