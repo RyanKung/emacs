@@ -307,6 +307,8 @@ long context_menu_value = 0;
 
 /* display update */
 static struct frame *ns_updating_frame;
+static bool ns_updating_locked;
+static bool ns_in_read_socket;
 static int ns_window_num = 0;
 static BOOL gsaved = NO;
 #ifdef NS_IMPL_COCOA
@@ -1078,13 +1080,12 @@ ns_update_begin (struct frame *f)
    external (RIF) call; whole frame, called before gui_update_window_begin
    -------------------------------------------------------------------------- */
 {
-  EmacsView *view = FRAME_NS_VIEW (f);
   NSTRACE_WHEN (NSTRACE_GROUP_UPDATES, "ns_update_begin");
 
   ns_update_auto_hide_menu_bar ();
 
   ns_updating_frame = f;
-  [view lockFocus];
+  ns_updating_locked = false;
 }
 
 /* --------------------------------------------------------------------------
@@ -1224,10 +1225,14 @@ ns_update_end (struct frame *f)
 
   block_input ();
 
-  [view unlockFocus];
+  if (ns_updating_locked)
+    {
+      [view unlockFocus];
+      ns_updating_locked = false;
 #if defined (NS_IMPL_GNUSTEP) || MAC_OS_X_VERSION_MIN_REQUIRED < 101400
-  [[view window] flushWindow];
+      [[view window] flushWindow];
 #endif
+    }
 
 #ifdef NS_IMPL_COCOA
   ns_UAZoomChangeFocus (view, false);
@@ -1254,10 +1259,12 @@ ns_focus (struct frame *f, NSRect *r, int n)
       NSTRACE_RECT ("r", *r);
     }
 
-  if (f != ns_updating_frame)
+  if (f != ns_updating_frame || !ns_updating_locked)
     {
       EmacsView *view = FRAME_NS_VIEW (f);
       [view lockFocus];
+      if (f == ns_updating_frame)
+        ns_updating_locked = true;
     }
 
   /* clipping */
@@ -5195,7 +5202,10 @@ ns_read_socket_1 (struct terminal *terminal, struct input_event *hold_quit,
 static int
 ns_read_socket (struct terminal *terminal, struct input_event *hold_quit)
 {
-  return ns_read_socket_1 (terminal, hold_quit, NO);
+  ns_in_read_socket = true;
+  int n = ns_read_socket_1 (terminal, hold_quit, NO);
+  ns_in_read_socket = false;
+  return n;
 }
 
 
@@ -5786,9 +5796,15 @@ static void
 ns_flush_display (struct frame *f)
 {
   struct input_event ie;
+  bool saved_in_read_socket = ns_in_read_socket;
 
+  ns_in_read_socket = false;
+#if defined (NS_IMPL_COCOA) && MAC_OS_X_VERSION_MIN_REQUIRED >= 101400
+  [FRAME_NS_VIEW (f) setNeedsDisplay:YES];
+#endif
   EVENT_INIT (ie);
   ns_read_socket_1 (FRAME_TERMINAL (f), &ie, YES);
+  ns_in_read_socket = saved_in_read_socket;
 }
 
 /* This and next define (many of the) public functions in this
@@ -9384,6 +9400,8 @@ static void cancel_ns_deferred_UAZoomChangeFocus_timer ()
                (char *) srcPixels + y * rowSize,
                srcRowSize);
 
+  [self setNeedsDisplay:YES];
+
 #else
   hide_bell();              // Ensure the bell image isn't scrolled.
 
@@ -11126,6 +11144,9 @@ nswindow_orderedIndex_sort (id w1, id w2, void *c)
    ========================================================================== */
 
 @implementation EmacsLayer
+{
+  bool openedInReadSocket;
+}
 
 
 /* An IOSurface is a pixel buffer that is efficiently copied to VRAM
@@ -11158,7 +11179,7 @@ nswindow_orderedIndex_sort (id w1, id w2, void *c)
     {
       [self setColorSpace:nil];
       [self setDoubleBuffered:db];
-      cache = [[NSMutableArray arrayWithCapacity:(doubleBuffered ? 2 : 1)] retain];
+      cache = [[NSMutableArray arrayWithCapacity:(doubleBuffered ? 4 : 1)] retain];
     }
   else
     return nil;
@@ -11258,7 +11279,7 @@ nswindow_orderedIndex_sort (id w1, id w2, void *c)
             }
         }
 
-      if (!surface && [cache count] >= (doubleBuffered ? 2 : 1))
+      if (!surface && [cache count] >= (doubleBuffered ? 4 : 1))
         {
           /* Just grab the first one off the cache.  This may result
              in tearing effects.  The alternative is to wait for one
@@ -11313,6 +11334,7 @@ nswindow_orderedIndex_sort (id w1, id w2, void *c)
 
       CGContextTranslateCTM(context, 0, IOSurfaceGetHeight (surface));
       CGContextScaleCTM(context, scale, -scale);
+      openedInReadSocket = ns_in_read_socket;
     }
 
   return context;
@@ -11341,6 +11363,9 @@ nswindow_orderedIndex_sort (id w1, id w2, void *c)
 - (void) display
 {
   NSTRACE_WHEN (NSTRACE_GROUP_FOCUS, "[EmacsLayer display]");
+
+  if (ns_in_read_socket && !openedInReadSocket)
+    return;
 
   if (context && context != [[NSGraphicsContext currentContext] CGContext])
     {
