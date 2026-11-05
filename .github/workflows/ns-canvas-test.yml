@@ -1,0 +1,302 @@
+name: macOS NS Canvas Flickering Test (bug#82090)
+
+on:
+  push:
+    branches:
+      - ns-canvas-flicker-ci
+  workflow_dispatch:
+
+jobs:
+  macos-ns-canvas:
+    name: Verify NS Canvas Flickering Fix on macOS GUI
+    runs-on: macos-15-intel
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 5
+
+      - name: Ensure build tools (autoconf, texinfo)
+        run: |
+          if [ -d "$(brew --prefix texinfo 2>/dev/null)/bin" ]; then
+            echo "$(brew --prefix texinfo)/bin" >> $GITHUB_PATH
+          fi
+          if ! command -v autoconf >/dev/null 2>&1 || ! command -v makeinfo >/dev/null 2>&1; then
+            HOMEBREW_NO_AUTO_UPDATE=1 brew install autoconf texinfo
+            echo "$(brew --prefix texinfo)/bin" >> $GITHUB_PATH
+          fi
+
+      - name: Configure and build Emacs.app (with patch)
+        run: |
+          ./autogen.sh
+          ./configure \
+            --with-ns \
+            --with-modules \
+            --without-native-compilation \
+            --without-gnutls \
+            --without-xml2 \
+            --without-tree-sitter \
+            --without-compress-install \
+            CFLAGS="-g -O2"
+          make -j$(sysctl -n hw.ncpu)
+
+      - name: Build canvas-probe.so and canvas-demo.so
+        run: |
+          mkdir -p /tmp/canvas-test
+          cat << 'EOF' > /tmp/canvas-test/canvas-probe.m
+          #import <Cocoa/Cocoa.h>
+          #import <QuartzCore/QuartzCore.h>
+          #import <IOSurface/IOSurface.h>
+          #import <objc/runtime.h>
+          #include <emacs-module.h>
+          #include <pthread.h>
+          #include <unistd.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+
+          int plugin_is_GPL_compatible;
+
+          static FILE *log_fp = NULL;
+          static volatile IOSurfaceRef tracked_surfs[8] = {0};
+          static volatile int num_tracked = 0;
+          static volatile int keep_sampling = 1;
+          static volatile int started_canvas = 0;
+          static int total_in_use_samples = 0;
+          static int white_while_in_use = 0;
+          static int get_ctx_count = 0;
+          static int display_count = 0;
+          static int in_use_picked_count = 0;
+          static int flips_in_current_tick = 0;
+          static int multi_flip_ticks = 0;
+          static pthread_t sampler_thread;
+
+          static CGContextRef (*orig_getContext)(id, SEL);
+          static void (*orig_display)(id, SEL);
+
+          static void track_surface(IOSurfaceRef s) {
+              if (!s) return;
+              for (int i = 0; i < num_tracked; i++) {
+                  if (tracked_surfs[i] == s) return;
+              }
+              if (num_tracked < 8) {
+                  tracked_surfs[num_tracked++] = s;
+              }
+          }
+
+          static CGContextRef hooked_getContext(id self, SEL _cmd) {
+              Ivar ctxIvar = class_getInstanceVariable([self class], "context");
+              CGContextRef existingCtx = *(CGContextRef *)((char *)self + ivar_getOffset(ctxIvar));
+              Ivar curSurfIvar = class_getInstanceVariable([self class], "currentSurface");
+
+              if (!existingCtx) {
+                  get_ctx_count++;
+                  CGContextRef res = orig_getContext(self, _cmd);
+                  IOSurfaceRef picked = *(IOSurfaceRef *)((char *)self + ivar_getOffset(curSurfIvar));
+                  track_surface(picked);
+                  if (picked && IOSurfaceIsInUse(picked)) {
+                      in_use_picked_count++;
+                  }
+                  return res;
+              }
+              return orig_getContext(self, _cmd);
+          }
+
+          static void hooked_display(id self, SEL _cmd) {
+              Ivar ctxIvar = class_getInstanceVariable([self class], "context");
+              CGContextRef existingCtxBefore = *(CGContextRef *)((char *)self + ivar_getOffset(ctxIvar));
+              orig_display(self, _cmd);
+              CGContextRef existingCtxAfter = *(CGContextRef *)((char *)self + ivar_getOffset(ctxIvar));
+              if (existingCtxBefore && !existingCtxAfter) {
+                  display_count++;
+                  flips_in_current_tick++;
+              }
+          }
+
+          static void check_surf(IOSurfaceRef s) {
+              if (!s || !IOSurfaceIsInUse(s)) return;
+              uint8_t *base = (uint8_t *)IOSurfaceGetBaseAddress(s);
+              size_t bpr = IOSurfaceGetBytesPerRow(s);
+              size_t w = IOSurfaceGetWidth(s);
+              size_t h = IOSurfaceGetHeight(s);
+              if (base && w > 200 && h > 200) {
+                  size_t px = 150, py = 100;
+                  uint32_t bgra = *(uint32_t *)(base + py * bpr + px * 4);
+                  uint8_t b = bgra & 0xFF;
+                  uint8_t g = (bgra >> 8) & 0xFF;
+                  uint8_t r = (bgra >> 16) & 0xFF;
+                  if (r > 200 && g < 80 && b < 80) {
+                      started_canvas = 1;
+                  }
+                  if (started_canvas) {
+                      total_in_use_samples++;
+                      if (r > 200 && g > 200 && b > 200) {
+                          white_while_in_use++;
+                      }
+                  }
+              }
+          }
+
+          static void *sampler_func(void *arg) {
+              while (keep_sampling) {
+                  int n = num_tracked;
+                  for (int i = 0; i < n; i++) {
+                      check_surf(tracked_surfs[i]);
+                  }
+                  usleep(100);
+              }
+              return NULL;
+          }
+
+          static emacs_value reset_stats(emacs_env *env, ptrdiff_t nargs, emacs_value args[], void *data) {
+              get_ctx_count = 0;
+              display_count = 0;
+              in_use_picked_count = 0;
+              flips_in_current_tick = 0;
+              multi_flip_ticks = 0;
+              white_while_in_use = 0;
+              return env->intern(env, "t");
+          }
+
+          static emacs_value mark_tick(emacs_env *env, ptrdiff_t nargs, emacs_value args[], void *data) {
+              if (flips_in_current_tick > 1) {
+                  multi_flip_ticks++;
+              }
+              flips_in_current_tick = 0;
+              return env->intern(env, "t");
+          }
+
+          static emacs_value dump_stats(emacs_env *env, ptrdiff_t nargs, emacs_value args[], void *data) {
+              if (flips_in_current_tick > 1) {
+                  multi_flip_ticks++;
+              }
+              keep_sampling = 0;
+              pthread_join(sampler_thread, NULL);
+              if (log_fp) {
+                  fprintf(log_fp, "num_surfaces=%d getContext=%d display_flips=%d multi_flip_ticks=%d picked_in_use=%d white_while_in_use=%d\n",
+                          num_tracked, get_ctx_count, display_count, multi_flip_ticks, in_use_picked_count, white_while_in_use);
+                  fflush(log_fp);
+              }
+              return env->intern(env, "t");
+          }
+
+          int emacs_module_init(struct emacs_runtime *rt) {
+              const char *out = getenv("PROBE_LOG_FILE");
+              log_fp = fopen(out ? out : "/tmp/canvas-test/probe.log", "w");
+              Class layerCls = objc_getClass("EmacsLayer");
+              if (layerCls) {
+                  Method m1 = class_getInstanceMethod(layerCls, @selector(getContext));
+                  orig_getContext = (void *)method_getImplementation(m1);
+                  method_setImplementation(m1, (IMP)hooked_getContext);
+
+                  Method m2 = class_getInstanceMethod(layerCls, @selector(display));
+                  orig_display = (void *)method_getImplementation(m2);
+                  method_setImplementation(m2, (IMP)hooked_display);
+              }
+              pthread_create(&sampler_thread, NULL, sampler_func, NULL);
+              emacs_env *env = rt->get_environment(rt);
+              env->funcall(env, env->intern(env, "defalias"), 2,
+                           (emacs_value[]){
+                               env->intern(env, "probe-reset-stats"),
+                               env->make_function(env, 0, 0, reset_stats, 0, 0)
+                           });
+              env->funcall(env, env->intern(env, "defalias"), 2,
+                           (emacs_value[]){
+                               env->intern(env, "probe-mark-tick"),
+                               env->make_function(env, 0, 0, mark_tick, 0, 0)
+                           });
+              env->funcall(env, env->intern(env, "defalias"), 2,
+                           (emacs_value[]){
+                               env->intern(env, "probe-dump-stats"),
+                               env->make_function(env, 0, 0, dump_stats, 0, 0)
+                           });
+              return 0;
+          }
+          EOF
+
+          cat << 'EOF' > /tmp/canvas-test/test-vector.el
+          ;;; -*- lexical-binding: t -*-
+          (module-load "/tmp/canvas-test/canvas-probe.so")
+
+          (switch-to-buffer (get-buffer-create "*rect-test*"))
+          (delete-other-windows)
+
+          (defun make-rect (width height pixel)
+            (make-vector (* width height) pixel))
+
+          (setq rect-canvas-vec (make-rect 250 250 #xFFFF0000))
+          (setq rect-canvas `(image :type canvas :id rect-canvas
+                                    :data-width 250
+                                    :data-height 250
+                                    :data ,rect-canvas-vec))
+          (insert (propertize "#" 'display rect-canvas))
+          (redisplay t)
+          (probe-reset-stats)
+
+          (defvar rect-canvas-i 0)
+          (defun rect-canvas-step ()
+            (probe-mark-tick)
+            (if (< rect-canvas-i 100)
+                (progn
+                  (dotimes (k 25)
+                    (aset rect-canvas-vec (+ (* 115 250) (* rect-canvas-i 25) k) #xFF0000FF))
+                  (canvas-refresh rect-canvas t)
+                  (setq rect-canvas-i (1+ rect-canvas-i))
+                  (run-with-timer 0.010 nil #'rect-canvas-step))
+              (probe-dump-stats)
+              (kill-emacs 0)))
+
+          (run-with-timer 0.010 nil #'rect-canvas-step)
+          EOF
+
+          clang -dynamiclib -O2 -Isrc \
+            -framework Cocoa -framework QuartzCore -framework IOSurface \
+            /tmp/canvas-test/canvas-probe.m -o /tmp/canvas-test/canvas-probe.so
+
+      - name: Run GUI Canvas Test (AFTER PATCH)
+        run: |
+          export PROBE_LOG_FILE=/tmp/canvas-test/after.log
+          ./src/emacs -Q -l /tmp/canvas-test/test-vector.el
+          echo "=== AFTER PATCH ==="
+          cat /tmp/canvas-test/after.log
+
+      - name: Revert src/nsterm.m and Run GUI Canvas Test (BEFORE PATCH)
+        run: |
+          git checkout HEAD~2 -- src/nsterm.m
+          make -j$(sysctl -n hw.ncpu) -C src emacs emacs.pdmp
+          export PROBE_LOG_FILE=/tmp/canvas-test/before.log
+          ./src/emacs -Q -l /tmp/canvas-test/test-vector.el
+          echo "=== BEFORE PATCH ==="
+          cat /tmp/canvas-test/before.log
+
+      - name: Verify Results and Generate Summary
+        run: |
+          BEFORE=$(cat /tmp/canvas-test/before.log)
+          AFTER=$(cat /tmp/canvas-test/after.log)
+          echo "Before: $BEFORE"
+          echo "After:  $AFTER"
+
+          AFTER_MULTI=$(echo "$AFTER" | sed -n 's/.*multi_flip_ticks=\([0-9]*\).*/\1/p')
+          AFTER_IN_USE=$(echo "$AFTER" | sed -n 's/.*picked_in_use=\([0-9]*\).*/\1/p')
+          AFTER_WHITE=$(echo "$AFTER" | sed -n 's/.*white_while_in_use=\([0-9]*\).*/\1/p')
+          BEFORE_MULTI=$(echo "$BEFORE" | sed -n 's/.*multi_flip_ticks=\([0-9]*\).*/\1/p')
+
+          cat << EOF >> $GITHUB_STEP_SUMMARY
+          ## macOS NS Canvas Animation Flickering Test (\`bug#82090\`)
+
+          150 timer frames at 100Hz (\`canvas-refresh\` + active cursor redisplay):
+
+          | Build | Raw Probe Output |
+          | :--- | :--- |
+          | **Before Patch** | \`$BEFORE\` |
+          | **After Patch** | \`$AFTER\` |
+          EOF
+
+          if [ "$AFTER_MULTI" != "0" ] || [ "$AFTER_IN_USE" != "0" ] || [ "$AFTER_WHITE" != "0" ]; then
+            echo "ERROR: After-patch metrics failed assertions!"
+            exit 1
+          fi
+          if [ "$BEFORE_MULTI" -le 0 ]; then
+            echo "ERROR: Before-patch did not reproduce multi-flip ticks!"
+            exit 1
+          fi
+          echo "All assertions passed!"
